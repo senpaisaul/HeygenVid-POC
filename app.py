@@ -17,7 +17,8 @@ import requests
 import time
 import os
 from openai import OpenAI
-
+from dotenv import load_dotenv
+load_dotenv()
 # ─── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="UGC Ad Generator", page_icon="🎬", layout="wide")
 
