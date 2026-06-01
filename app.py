@@ -12,13 +12,17 @@ Flow:
 5. We poll until the video is ready and display it
 """
 
-import streamlit as st
-import requests
-import time
 import os
-from openai import OpenAI
+import time
+import requests
+import streamlit as st
 from dotenv import load_dotenv
+from openai import OpenAI
+
+# Load .env for local dev. On Streamlit Cloud, this no-ops and the platform's
+# Secrets are exposed as env vars instead — same code path either way.
 load_dotenv()
+
 # ─── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="UGC Ad Generator", page_icon="🎬", layout="wide")
 
@@ -57,10 +61,10 @@ AZURE_ENDPOINT = os.getenv(
     "https://scalistro-test-v1-resource.openai.azure.com/openai/v1",
 )
 AZURE_API_KEY = os.getenv("AZURE_EASTUS2_API_KEY", "")
-AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2025-04-01-preview")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "preview")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
 
-# ─── Sidebar: HeyGen key + Azure status + model toggle ────────────────────────
+# ─── Sidebar: HeyGen key + model toggle ───────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🔑 API Configuration")
     heygen_key = st.text_input(
@@ -95,12 +99,16 @@ def get_azure_client():
     """
     Azure OpenAI v1 API surface — used via the standard OpenAI SDK by pointing
     base_url at the Azure /openai/v1 endpoint and pinning the api-version.
+
+    Sends both `Authorization: Bearer …` (SDK default) and an explicit `api-key`
+    header so we work regardless of which one Azure validates against.
     """
     if not AZURE_API_KEY:
         raise RuntimeError("AZURE_EASTUS2_API_KEY is not set")
     return OpenAI(
         base_url=AZURE_ENDPOINT,
         api_key=AZURE_API_KEY,
+        default_headers={"api-key": AZURE_API_KEY},
         default_query={"api-version": AZURE_API_VERSION},
     )
 
@@ -248,7 +256,22 @@ def create_heygen_video(prompt, avatar_id, voice_id, files_payload, orientation)
         json=body,
         timeout=60,
     )
-    r.raise_for_status()
+
+    if not r.ok:
+        # Surface HeyGen's actual error message instead of just the status code
+        try:
+            err = r.json()
+        except Exception:
+            err = r.text
+        debug_body = {
+            **body,
+            "prompt": (body["prompt"][:120] + "…") if len(body["prompt"]) > 120 else body["prompt"],
+            "files": f"<{len(files_payload or [])} files>",
+        }
+        raise RuntimeError(
+            f"HeyGen {r.status_code}: {err}\nRequest sent: {debug_body}"
+        )
+
     return r.json()["data"]
 
 
@@ -307,10 +330,10 @@ st.markdown("## 📦 Step 1 — Your Product")
 col1, col2 = st.columns(2)
 with col1:
     product_link = st.text_input(
-        "Product URL",
-        placeholder="https://example.com/my-awesome-product",
-        help="Link to your product page, Amazon listing, Shopify store, etc."
-    )
+    "Product URL (optional)",
+    placeholder="https://example.com/my-awesome-product",
+    help="Optional context for the AI — paste your listing URL if you have one"
+)
 with col2:
     orientation_choice = st.selectbox(
         "Video orientation",
@@ -445,8 +468,7 @@ st.divider()
 st.markdown("## 🚀 Step 3 — Generate Your Ad")
 
 ready = (
-    product_link
-    and ad_description
+    ad_description
     and st.session_state.selected_avatar_id
     and selected_voice_id
 )
@@ -474,8 +496,10 @@ if st.button("🎬 Generate UGC Video Ad", type="primary",
                     st.warning(f"⚠️ Failed to upload {uf.name}: {e}")
             upload_status.update(label="Assets uploaded!", state="complete")
 
-    # Also pass the product link as a URL file for HeyGen context
-    if product_link.startswith("http"):
+    # Only forward URLs to HeyGen if they point at direct media files.
+    # Arbitrary product pages (text/html) get rejected by /v3/video-agents.
+    MEDIA_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm", ".mov")
+    if product_link.lower().split("?")[0].endswith(MEDIA_EXTS):
         files_payload.append({"type": "url", "url": product_link})
 
     # ── Azure OpenAI creative director ──
