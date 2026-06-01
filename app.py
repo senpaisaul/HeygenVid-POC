@@ -1,12 +1,13 @@
 """
 UGC Video Ad Pipeline
-User Input → OpenAI Creative Director → HeyGen Video Generation
+User Input → Azure OpenAI Creative Director → HeyGen Video Generation
 
 Flow:
 1. User provides product link, uploads assets, writes a brief description
 2. User picks an avatar + voice from HeyGen's public library
-3. OpenAI acts as a creative director — analyzes everything and writes a
-   rich generation prompt (scene direction, tone, pacing, CTA)
+3. Azure OpenAI (gpt-5-mini / gpt-5-nano) acts as a creative director —
+   analyzes everything and writes a rich generation prompt
+   (scene direction, tone, pacing, CTA)
 4. That prompt + avatar + voice + assets are sent to HeyGen Video Agent
 5. We poll until the video is ready and display it
 """
@@ -14,8 +15,6 @@ Flow:
 import streamlit as st
 import requests
 import time
-import json
-import base64
 import os
 from openai import OpenAI
 
@@ -51,28 +50,60 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Sidebar: API keys ────────────────────────────────────────────────────────
+# ─── Azure OpenAI config (env-driven, no UI input for keys) ───────────────────
+AZURE_ENDPOINT = os.getenv(
+    "AZURE_EASTUS2_ENDPOINT",
+    "https://scalistro-test-v1-resource.openai.azure.com/openai/v1",
+)
+AZURE_API_KEY = os.getenv("AZURE_EASTUS2_API_KEY", "")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2025-04-01-preview")
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
+
+# ─── Sidebar: HeyGen key + Azure status + model toggle ────────────────────────
 with st.sidebar:
-    st.markdown("## 🔑 API Keys")
-    heygen_key = st.text_input("HeyGen API Key", type="password",
-                               value=os.getenv("HEYGEN_API_KEY", ""),
-                               help="Get yours at app.heygen.com → Settings → API")
-    openai_key = st.text_input("OpenAI API Key", type="password",
-                               value=os.getenv("OPENAI_API_KEY", ""),
-                               help="Get yours at platform.openai.com")
+    st.markdown("## 🔑 API Configuration")
+    heygen_key = st.text_input(
+        "HeyGen API Key", type="password",
+        value=os.getenv("HEYGEN_API_KEY", ""),
+        help="Get yours at app.heygen.com → Settings → API",
+    )
+
+    selected_model = st.radio(
+        "Creative director model",
+        ["gpt-5-mini", "gpt-5-nano"],
+        index=0 if AZURE_DEPLOYMENT == "gpt-5-mini" else 1,
+        horizontal=True,
+        help="`mini` = better creative quality • `nano` = faster & cheaper",
+        captions=["Better quality", "Faster & cheaper"],
+    )
+
     st.divider()
     st.markdown("### How it works")
     st.markdown("""
     1. **You** provide product link, assets & a brief  
     2. **Pick** an avatar & voice from HeyGen  
-    3. **OpenAI** crafts a creative ad prompt  
+    3. **Azure OpenAI** crafts a creative ad prompt  
     4. **HeyGen** generates the video  
     5. **Download** your UGC ad 🎉
     """)
 
 HEYGEN_BASE = "https://api.heygen.com"
 
-# ─── Helper functions ──────────────────────────────────────────────────────────
+# ─── Azure OpenAI client ──────────────────────────────────────────────────────
+def get_azure_client():
+    """
+    Azure OpenAI v1 API surface — used via the standard OpenAI SDK by pointing
+    base_url at the Azure /openai/v1 endpoint and pinning the api-version.
+    """
+    if not AZURE_API_KEY:
+        raise RuntimeError("AZURE_EASTUS2_API_KEY is not set")
+    return OpenAI(
+        base_url=AZURE_ENDPOINT,
+        api_key=AZURE_API_KEY,
+        default_query={"api-version": AZURE_API_VERSION},
+    )
+
+# ─── HeyGen helpers ───────────────────────────────────────────────────────────
 
 def heygen_headers():
     return {"X-Api-Key": heygen_key, "Content-Type": "application/json"}
@@ -144,13 +175,13 @@ def upload_asset_to_heygen(file_bytes, filename):
     return r.json()["data"]["asset_id"]
 
 
-def generate_creative_prompt(product_link, description, asset_names):
+def generate_creative_prompt(product_link, description, asset_names, model):
     """
-    The OpenAI creative director layer.
+    The Azure OpenAI creative director layer.
     Takes the raw user inputs and produces a rich, scene-directed generation
     prompt for HeyGen's Video Agent.
     """
-    client = OpenAI(api_key=openai_key)
+    client = get_azure_client()
 
     system_msg = """You are an elite UGC video ad creative director. Your job is to take a 
 product link, uploaded asset descriptions, and a brief user description, then produce a 
@@ -185,14 +216,15 @@ Uploaded assets: {', '.join(asset_names) if asset_names else 'None provided'}
 
 Generate the video ad prompt."""
 
+    # GPT-5 family on Azure: use `max_completion_tokens`, omit `temperature`
+    # (reasoning models default to 1 and may reject custom values).
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=model,
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        temperature=0.8,
-        max_tokens=1500,
+        max_completion_tokens=1500,
     )
     return response.choices[0].message.content.strip()
 
@@ -260,9 +292,12 @@ st.markdown("# 🎬 UGC Video Ad Generator")
 st.markdown("Turn any product into a scroll-stopping UGC video ad in minutes.")
 st.divider()
 
-# Check keys
-if not heygen_key or not openai_key:
-    st.warning("⬅️  Enter both API keys in the sidebar to get started.")
+# Check config
+if not heygen_key:
+    st.warning("⬅️  Enter your HeyGen API key in the sidebar to get started.")
+    st.stop()
+if not AZURE_API_KEY:
+    st.error("Azure OpenAI is not configured. Set the AZURE_* variables in your `.env` and restart.")
     st.stop()
 
 # ─── Step 1: Product Info ─────────────────────────────────────────────────────
@@ -442,17 +477,17 @@ if st.button("🎬 Generate UGC Video Ad", type="primary",
     if product_link.startswith("http"):
         files_payload.append({"type": "url", "url": product_link})
 
-    # ── OpenAI creative director ──
-    with st.status("🧠 OpenAI is crafting your ad concept…", expanded=True) as ai_status:
+    # ── Azure OpenAI creative director ──
+    with st.status(f"🧠 {selected_model} is crafting your ad concept…", expanded=True) as ai_status:
         try:
             creative_prompt = generate_creative_prompt(
-                product_link, ad_description, asset_names
+                product_link, ad_description, asset_names, model=selected_model
             )
             st.markdown("**Generated creative prompt:**")
             st.code(creative_prompt, language=None)
             ai_status.update(label="Creative direction ready!", state="complete")
         except Exception as e:
-            st.error(f"OpenAI error: {e}")
+            st.error(f"Azure OpenAI error: {e}")
             st.stop()
 
     # ── Send to HeyGen ──
